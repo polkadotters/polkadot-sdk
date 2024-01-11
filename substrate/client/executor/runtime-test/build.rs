@@ -16,28 +16,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+#[cfg(feature = "std")]
 fn main() {
 	// regular build
-	#[cfg(feature = "std")]
-	{
-		substrate_wasm_builder::WasmBuilder::new()
-			.with_current_project()
-			.export_heap_base()
-			.import_memory()
-			.disable_runtime_version_section_check()
-			.build();
-	}
+	substrate_wasm_builder::WasmBuilder::new()
+		.with_current_project()
+		.export_heap_base()
+		.import_memory()
+		.disable_runtime_version_section_check()
+		.build();
 
 	// and building with tracing activated
-	#[cfg(feature = "std")]
-	{
-		substrate_wasm_builder::WasmBuilder::new()
-			.with_current_project()
-			.export_heap_base()
-			.import_memory()
-			.set_file_name("wasm_binary_with_tracing.rs")
-			.append_to_rust_flags(r#"--cfg feature="with-tracing""#)
-			.disable_runtime_version_section_check()
-			.build();
-	}
+	substrate_wasm_builder::WasmBuilder::new()
+		.with_current_project()
+		.export_heap_base()
+		.import_memory()
+		.set_file_name("wasm_binary_with_tracing.rs")
+		.append_to_rust_flags(r#"--cfg feature="with-tracing""#)
+		.disable_runtime_version_section_check()
+		.build();
 }
+
+#[cfg(not(feature = "std"))]
+fn main() {}

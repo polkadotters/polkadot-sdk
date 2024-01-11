@@ -8934,6 +8934,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_enum"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02339744ee7253741199f897151b38e72257d13802d4ee837285cc2990a90845"
+dependencies = [
+ "num_enum_derive",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "681030a937600a36906c185595136d26abfebb4aa9c65701cefcaf8578bb982b"
+dependencies = [
+ "proc-macro-crate 3.0.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.49",
+]
+
+[[package]]
 name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9628,6 +9649,7 @@ dependencies = [
  "sp-runtime",
  "sp-std 14.0.0",
  "sp-tracing 16.0.0",
+ "sp-virtualization",
  "staging-xcm",
  "staging-xcm-builder",
  "wasm-instrument",
@@ -13811,6 +13833,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkavm"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e765e91f5dc522be41639e803c980cbea2d3585c8698cba66d44134bf9a773"
+dependencies = [
+ "libc",
+ "log",
+ "polkavm-assembler",
+ "polkavm-common 0.8.0",
+ "polkavm-linux-raw",
+]
+
+[[package]]
+name = "polkavm-assembler"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd423e4d78b916afde0e088863525e6ff8edf7804d0809d47622ac89035ec66"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "polkavm-common"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13821,6 +13865,9 @@ name = "polkavm-common"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92c99f7eee94e7be43ba37eef65ad0ee8cbaf89b7c00001c3f6d2be985cb1817"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "polkavm-derive"
@@ -13904,6 +13951,12 @@ dependencies = [
  "regalloc2 0.9.3",
  "rustc-demangle",
 ]
+
+[[package]]
+name = "polkavm-linux-raw"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fafe52ef2fa9a0bbf98f90648996f84099208da64715ce7080229987e9981814"
 
 [[package]]
 name = "polling"
@@ -16099,6 +16152,7 @@ dependencies = [
  "sp-tracing 16.0.0",
  "sp-trie",
  "sp-version",
+ "sp-virtualization-test-fixture",
  "sp-wasm-interface 20.0.0",
  "substrate-test-runtime",
  "tempfile",
@@ -16136,6 +16190,7 @@ dependencies = [
  "sc-runtime-test",
  "sp-io",
  "sp-runtime-interface 24.0.0",
+ "sp-virtualization",
  "sp-wasm-interface 20.0.0",
  "tempfile",
  "wasmtime",
@@ -16624,6 +16679,7 @@ dependencies = [
  "sp-runtime",
  "sp-runtime-interface 24.0.0",
  "sp-std 14.0.0",
+ "sp-virtualization",
  "substrate-wasm-builder",
 ]
 
@@ -18685,6 +18741,7 @@ dependencies = [
  "ed25519-dalek",
  "libsecp256k1",
  "log",
+ "num_enum",
  "parity-scale-codec",
  "rustversion",
  "secp256k1",
@@ -19189,6 +19246,26 @@ dependencies = [
  "quote",
  "sp-version",
  "syn 2.0.49",
+]
+
+[[package]]
+name = "sp-virtualization"
+version = "1.0.0"
+dependencies = [
+ "log",
+ "polkavm",
+ "sp-io",
+ "sp-std 14.0.0",
+ "sp-tracing 16.0.0",
+ "sp-virtualization-test-fixture",
+]
+
+[[package]]
+name = "sp-virtualization-test-fixture"
+version = "1.0.0"
+dependencies = [
+ "polkavm-derive 0.8.0",
+ "substrate-wasm-builder",
 ]
 
 [[package]]
