@@ -669,6 +669,8 @@ fn expand_functions(def: &EnvDef, expand_blocks: bool, host_state: TokenStream2)
 					 .consume_fuel(fuel_consumed)
 					 .map_err(|_| TrapReason::from(Error::<E::T>::OutOfGas))
 					 .map_err(#into_host)?;
+				use ::sp_runtime::Saturating;
+				__caller__.data_mut().ext().gas_meter_mut().engine_consumed.saturating_accrue(fuel_consumed);
 			}
 		} else {
 			quote! { }

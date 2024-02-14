@@ -80,7 +80,7 @@ pub struct GasMeter<T: Config> {
 	/// Due to `adjust_gas` and `nested` the `gas_left` can temporarily dip below its final value.
 	gas_left_lowest: Weight,
 	/// Amount of fuel consumed by the engine from the last host function call.
-	engine_consumed: u64,
+	pub engine_consumed: u64,
 	_phantom: PhantomData<T>,
 	#[cfg(test)]
 	tokens: Vec<ErasedToken>,
