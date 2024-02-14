@@ -31,7 +31,7 @@ use bitvec::{order::Lsb0 as BitOrderLsb0, vec::BitVec};
 use frame_support::{
 	defensive,
 	pallet_prelude::*,
-	traits::{Defensive, EnqueueMessage, Footprint, QueueFootprint},
+	traits::{EnqueueMessage, Footprint, QueueFootprint},
 	BoundedSlice,
 };
 use frame_system::pallet_prelude::*;
@@ -674,7 +674,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn process_candidates<GV>(
 		allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
 		candidates: Vec<BackedCandidate<T::Hash>>,
-		mut scheduled: BTreeMap<ParaId, Vec<CoreIndex>>,
+		mut scheduled: BTreeMap<ParaId, Vec<CoreIndex>>, // TODO: map from paraid to btreeset here
 		group_validators: GV,
 	) -> Result<ProcessedCandidates<T::Hash>, DispatchError>
 	where
@@ -688,204 +688,224 @@ impl<T: Config> Pallet<T> {
 			return Ok(ProcessedCandidates::default())
 		}
 
-		let minimum_backing_votes = configuration::Pallet::<T>::config().minimum_backing_votes;
 		let validators = shared::Pallet::<T>::active_validator_keys();
 
 		// Collect candidate receipts with backers.
 		let mut candidate_receipt_with_backing_validator_indices =
 			Vec::with_capacity(candidates.len());
 
-		// Do all checks before writing storage.
-		let core_indices_and_backers = {
-			let mut core_indices_and_backers = Vec::with_capacity(candidates.len());
-			let mut last_core = None;
+		let mut core_indices = Vec::with_capacity(candidates.len());
 
-			let mut check_assignment_in_order = |core_idx| -> DispatchResult {
-				ensure!(
-					last_core.map_or(true, |core| core_idx > core),
-					Error::<T>::ScheduledOutOfOrder,
-				);
+		let candidates: BTreeMap<ParaId, Vec<BackedCandidate<T::Hash>>> =
+			candidates.into_iter().fold(BTreeMap::new(), |acc, candidate| {
+				acc.entry(candidate.candidate.descriptor.para_id)
+					.or_insert_with(|| vec![])
+					.push(candidate);
+				acc
+			});
 
-				last_core = Some(core_idx);
-				Ok(())
+		'para_loop: for (para_id, candidates) in candidates {
+			let Some(mut cores) = scheduled.remove(&para_id) else { continue };
+			// Reverse because we'll pop cores from the back, as it's more efficient for a vector.
+			cores.reverse();
+
+			let maybe_latest_head_data = match <PendingAvailabilityCommitments<T>>::get(&para_id)
+				.map(|commitments| commitments.last())
+				.flatten()
+			{
+				Some(commitments) => Some(commitments.head_data),
+				None => <paras::Pallet<T>>::para_head(&para_id),
+			};
+			// TODO: can this legitimately ever be None? For parachain genesis maybe?
+			let mut latest_head_data = match maybe_latest_head_data {
+				None => continue,
+				Some(latest_head_data) => latest_head_data,
 			};
 
-			// We combine an outer loop over candidates with an inner loop over the scheduled,
-			// where each iteration of the outer loop picks up at the position
-			// in scheduled just after the past iteration left off.
-			//
-			// If the candidates appear in the same order as they appear in `scheduled`,
-			// then they should always be found. If the end of `scheduled` is reached,
-			// then the candidate was either not scheduled or out-of-order.
-			//
-			// In the meantime, we do certain sanity checks on the candidates and on the scheduled
-			// list.
-			for (candidate_idx, backed_candidate) in candidates.iter().enumerate() {
-				let relay_parent_hash = backed_candidate.descriptor().relay_parent;
-				let para_id = backed_candidate.descriptor().para_id;
+			// Now we need to arrange the candidates into a dependency chain based on the latest
+			// head.
+			// Since we don't know the parent_head_hash, we need to build the pvd for all candidates
+			// and check its hash against the one in the descriptor.
+			let mut used_candidates = BTreeSet::<usize>::new();
 
-				let prev_context = <paras::Pallet<T>>::para_most_recent_context(para_id);
+			// TODO: can we make this more performant?
+			loop {
+				let mut found_candidate = false;
 
-				let check_ctx = CandidateCheckContext::<T>::new(prev_context);
-				let signing_context = SigningContext {
-					parent_hash: relay_parent_hash,
-					session_index: shared::Pallet::<T>::session_index(),
-				};
+				// If we've run out of cores, go to the next para.
+				// TODO: No. we need to get the core from the inherent data. Use Andrei's PR for
+				// that.
+				let Some(core) = cores.pop() else { continue 'para_loop };
 
-				// TODO: this is already being done in process_inherent_data.
-				let relay_parent_number = match check_ctx.verify_backed_candidate(
-					&allowed_relay_parents,
-					candidate_idx,
-					backed_candidate,
-				)? {
-					Err(FailedToCreatePVD) => {
-						log::debug!(
-							target: LOG_TARGET,
-							"Failed to create PVD for candidate {}",
-							candidate_idx,
-						);
-						// We don't want to error out here because it will
-						// brick the relay-chain. So we return early without
-						// doing anything.
-						return Ok(ProcessedCandidates::default())
-					},
-					Ok(rpn) => rpn,
-				};
+				for (idx, candidate) in candidates.iter().enumerate() {
+					if !used_candidates.contains(&idx) {
+						// TODO: find out if we're correctly building the context here.
+						let check_ctx = CandidateCheckContext::<T>::new(None);
+						match check_ctx.verify_backed_candidate(
+							&allowed_relay_parents,
+							candidate,
+							latest_head_data,
+						)? {
+							// TODO: can a PVD mismatch hide some other issue?
+							Err(PVDMismatch) => {
+								// This means that this candidate is not a child of
+								// latest_head_data.
+								continue
+							},
+							Ok(relay_parent_number) => {
+								let candidate_hash = candidate.candidate.hash();
 
-				let para_id = backed_candidate.descriptor().para_id;
-				let mut backers = bitvec::bitvec![u8, BitOrderLsb0; 0; validators.len()];
+								// The candidate based upon relay parent `N` should be backed by a
+								// group assigned to core at block `N + 1`. Thus,
+								// `relay_parent_number + 1` will always land in the current
+								// session.
+								let group_idx = <scheduler::Pallet<T>>::group_assigned_to_core(
+									core,
+									relay_parent_number + One::one(),
+								)
+								.ok_or_else(|| {
+									log::warn!(
+										target: LOG_TARGET,
+										"Failed to compute group index for candidate {}",
+										candidate_hash
+									);
+									Error::<T>::InvalidAssignment
+								})?;
+								let group_vals = group_validators(group_idx)
+									.ok_or_else(|| Error::<T>::InvalidGroupIndex)?;
 
-				let core_idx = *scheduled.get(&para_id).ok_or(Error::<T>::UnscheduledCandidate)?;
-				check_assignment_in_order(core_idx)?;
-				ensure!(
-					<PendingAvailability<T>>::get(&para_id).is_none() &&
-						<PendingAvailabilityCommitments<T>>::get(&para_id).is_none(),
-					Error::<T>::CandidateScheduledBeforeParaFree,
-				);
+								// Check backing vote count and validity.
+								let (backers, backer_idx_and_attestation) =
+									Self::check_backing_votes(candidate, &validators, group_vals)?;
 
-				// The candidate based upon relay parent `N` should be backed by a group
-				// assigned to core at block `N + 1`. Thus, `relay_parent_number + 1`
-				// will always land in the current session.
-				let group_idx = <scheduler::Pallet<T>>::group_assigned_to_core(
-					core_idx,
-					relay_parent_number + One::one(),
-				)
-				.ok_or_else(|| {
-					log::warn!(
-						target: LOG_TARGET,
-						"Failed to compute group index for candidate {}",
-						candidate_idx
-					);
-					Error::<T>::InvalidAssignment
-				})?;
-				let group_vals =
-					group_validators(group_idx).ok_or_else(|| Error::<T>::InvalidGroupIndex)?;
+								latest_head_data = candidate.candidate.commitments.head_data;
+								used_candidates.insert(idx);
+								candidate_receipt_with_backing_validator_indices
+									.push((candidate.receipt(), backer_idx_and_attestation));
+								found_candidate = true;
+								core_indices.push((core, para_id));
 
-				// check the signatures in the backing and that it is a majority.
-				{
-					let maybe_amount_validated = primitives::check_candidate_backing(
-						&backed_candidate,
-						&signing_context,
-						group_vals.len(),
-						|intra_group_vi| {
-							group_vals
-								.get(intra_group_vi)
-								.and_then(|vi| validators.get(vi.0 as usize))
-								.map(|v| v.clone())
-						},
-					);
+								// Update storage
+								// initialize all availability votes to 0.
+								let availability_votes: BitVec<u8, BitOrderLsb0> =
+									bitvec::bitvec![u8, BitOrderLsb0; 0; validators.len()];
 
-					match maybe_amount_validated {
-						Ok(amount_validated) => ensure!(
-							amount_validated >=
-								effective_minimum_backing_votes(
-									group_vals.len(),
-									minimum_backing_votes
-								),
-							Error::<T>::InsufficientBacking,
-						),
-						Err(()) => {
-							Err(Error::<T>::InvalidBacking)?;
-						},
+								let (descriptor, commitments) = (
+									candidate.candidate.descriptor,
+									candidate.candidate.commitments,
+								);
+
+								<PendingAvailability<T>>::mutate(
+									&para_id,
+									|pending_availability| {
+										pending_availability.map(|pending_availability| {
+											pending_availability.push(
+												CandidatePendingAvailability {
+													core,
+													hash: candidate_hash,
+													descriptor,
+													availability_votes,
+													relay_parent_number,
+													backers: backers.to_bitvec(),
+													backed_in_number: now,
+													backing_group: group_idx,
+												},
+											);
+											pending_availability
+										})
+									},
+								);
+								<PendingAvailabilityCommitments<T>>::mutate(
+									&para_id,
+									|pending_commitments| {
+										pending_commitments.map(|pending_commitments| {
+											pending_commitments.push(commitments);
+											pending_commitments
+										})
+									},
+								);
+
+								// Deposit backed event.
+								Self::deposit_event(Event::<T>::CandidateBacked(
+									candidate.candidate.to_plain(),
+									candidate.candidate.commitments.head_data.clone(),
+									core,
+									group_idx,
+								));
+							},
+						};
 					}
-
-					let mut backer_idx_and_attestation =
-						Vec::<(ValidatorIndex, ValidityAttestation)>::with_capacity(
-							backed_candidate.validator_indices.count_ones(),
-						);
-					let candidate_receipt = backed_candidate.receipt();
-
-					for ((bit_idx, _), attestation) in backed_candidate
-						.validator_indices
-						.iter()
-						.enumerate()
-						.filter(|(_, signed)| **signed)
-						.zip(backed_candidate.validity_votes.iter().cloned())
-					{
-						let val_idx =
-							group_vals.get(bit_idx).expect("this query succeeded above; qed");
-						backer_idx_and_attestation.push((*val_idx, attestation));
-
-						backers.set(val_idx.0 as _, true);
-					}
-					candidate_receipt_with_backing_validator_indices
-						.push((candidate_receipt, backer_idx_and_attestation));
 				}
 
-				core_indices_and_backers.push((
-					(core_idx, para_id),
-					backers,
-					group_idx,
-					relay_parent_number,
-				));
+				if !found_candidate {
+					break
+				}
 			}
-
-			core_indices_and_backers
-		};
-
-		// one more sweep for actually writing to storage.
-		let core_indices = core_indices_and_backers.iter().map(|(c, ..)| *c).collect();
-		for (candidate, (core, backers, group, relay_parent_number)) in
-			candidates.into_iter().zip(core_indices_and_backers)
-		{
-			let para_id = candidate.descriptor().para_id;
-
-			// initialize all availability votes to 0.
-			let availability_votes: BitVec<u8, BitOrderLsb0> =
-				bitvec::bitvec![u8, BitOrderLsb0; 0; validators.len()];
-
-			Self::deposit_event(Event::<T>::CandidateBacked(
-				candidate.candidate.to_plain(),
-				candidate.candidate.commitments.head_data.clone(),
-				core.0,
-				group,
-			));
-
-			let candidate_hash = candidate.candidate.hash();
-
-			let (descriptor, commitments) =
-				(candidate.candidate.descriptor, candidate.candidate.commitments);
-
-			<PendingAvailability<T>>::insert(
-				&para_id,
-				CandidatePendingAvailability {
-					core: core.0,
-					hash: candidate_hash,
-					descriptor,
-					availability_votes,
-					relay_parent_number,
-					backers: backers.to_bitvec(),
-					backed_in_number: now,
-					backing_group: group,
-				},
-			);
-			<PendingAvailabilityCommitments<T>>::insert(&para_id, commitments);
 		}
 
 		Ok(ProcessedCandidates::<T::Hash> {
-			core_indices,
+			core_indices, // TODO: these may need to be sorted.
 			candidate_receipt_with_backing_validator_indices,
 		})
+	}
+
+	fn check_backing_votes(
+		backed_candidate: &BackedCandidate<T::Hash>,
+		validators: &[ValidatorId],
+		group_vals: Vec<ValidatorIndex>,
+	) -> Result<(BitVec<u8, BitOrderLsb0>, Vec<(ValidatorIndex, ValidityAttestation)>), Error<T>> {
+		let minimum_backing_votes = configuration::Pallet::<T>::config().minimum_backing_votes;
+
+		let mut backers = bitvec::bitvec![u8, BitOrderLsb0; 0; validators.len()];
+		let signing_context = SigningContext {
+			parent_hash: backed_candidate.descriptor().relay_parent,
+			session_index: shared::Pallet::<T>::session_index(),
+		};
+
+		// check the signatures in the backing and that it is a majority.
+		let maybe_amount_validated = primitives::check_candidate_backing(
+			&backed_candidate,
+			&signing_context,
+			group_vals.len(),
+			|intra_group_vi| {
+				group_vals
+					.get(intra_group_vi)
+					.and_then(|vi| validators.get(vi.0 as usize))
+					.map(|v| v.clone())
+			},
+		);
+
+		match maybe_amount_validated {
+			Ok(amount_validated) => ensure!(
+				amount_validated >=
+					effective_minimum_backing_votes(group_vals.len(), minimum_backing_votes),
+				Error::<T>::InsufficientBacking,
+			),
+			Err(()) => {
+				Err(Error::<T>::InvalidBacking)?;
+			},
+		}
+
+		let mut backer_idx_and_attestation =
+			Vec::<(ValidatorIndex, ValidityAttestation)>::with_capacity(
+				backed_candidate.validator_indices.count_ones(),
+			);
+		let candidate_receipt = backed_candidate.receipt();
+
+		for ((bit_idx, _), attestation) in backed_candidate
+			.validator_indices
+			.iter()
+			.enumerate()
+			.filter(|(_, signed)| **signed)
+			.zip(backed_candidate.validity_votes.iter().cloned())
+		{
+			let val_idx = group_vals.get(bit_idx).expect("this query succeeded above; qed");
+			backer_idx_and_attestation.push((*val_idx, attestation));
+
+			backers.set(val_idx.0 as _, true);
+		}
+
+		Ok((backers, backer_idx_and_attestation))
 	}
 
 	/// Run the acceptance criteria checks on the given candidate commitments.
@@ -1289,7 +1309,7 @@ pub(crate) struct CandidateCheckContext<T: Config> {
 
 /// An error indicating that creating Persisted Validation Data failed
 /// while checking a candidate's validity.
-pub(crate) struct FailedToCreatePVD;
+pub(crate) struct PVDMismatch;
 
 impl<T: Config> CandidateCheckContext<T> {
 	pub(crate) fn new(prev_context: Option<BlockNumberFor<T>>) -> Self {
@@ -1308,9 +1328,9 @@ impl<T: Config> CandidateCheckContext<T> {
 	pub(crate) fn verify_backed_candidate(
 		&self,
 		allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
-		candidate_idx: usize,
 		backed_candidate: &BackedCandidate<<T as frame_system::Config>::Hash>,
-	) -> Result<Result<BlockNumberFor<T>, FailedToCreatePVD>, Error<T>> {
+		parent_head_data: HeadData,
+	) -> Result<Result<BlockNumberFor<T>, PVDMismatch>, Error<T>> {
 		let para_id = backed_candidate.descriptor().para_id;
 		let relay_parent = backed_candidate.descriptor().relay_parent;
 
@@ -1323,23 +1343,18 @@ impl<T: Config> CandidateCheckContext<T> {
 		};
 
 		{
-			let persisted_validation_data = match crate::util::make_persisted_validation_data::<T>(
+			let persisted_validation_data = make_persisted_validation_data_with_parent::<T>(
 				para_id,
 				relay_parent_number,
 				relay_parent_storage_root,
-			)
-			.defensive_proof("the para is registered")
-			{
-				Some(l) => l,
-				None => return Ok(Err(FailedToCreatePVD)),
-			};
+				parent_head_data,
+			);
 
 			let expected = persisted_validation_data.hash();
 
-			ensure!(
-				expected == backed_candidate.descriptor().persisted_validation_data_hash,
-				Error::<T>::ValidationDataHashMismatch,
-			);
+			if expected != backed_candidate.descriptor().persisted_validation_data_hash {
+				return Ok(Err(PVDMismatch));
+			}
 		}
 
 		ensure!(
@@ -1374,7 +1389,7 @@ impl<T: Config> CandidateCheckContext<T> {
 			log::debug!(
 				target: LOG_TARGET,
 				"Validation outputs checking during inclusion of a candidate {} for parachain `{}` failed",
-				candidate_idx,
+				backed_candidate.hash(),
 				u32::from(para_id),
 			);
 			Err(err.strip_into_dispatch_err::<T>())?;

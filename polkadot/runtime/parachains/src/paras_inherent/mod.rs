@@ -609,16 +609,7 @@ impl<T: Config> Pallet<T> {
 					// never include a concluded-invalid candidate. we don't need to check for
 					// descendants of concluded-invalid candidates as those descendants have already
 					// been evicted from the cores and the included head data won't match.
-					current_concluded_invalid_disputes.contains(&backed_candidate.hash()) ||
-					// Instead of checking the candidates with code upgrades twice
-					// move the checking up here and skip it in the training wheels fallback.
-					// That way we avoid possible duplicate checks while assuring all
-					// backed candidates fine to pass on.
-					//
-					// NOTE: this is the only place where we check the relay-parent.
-					check_ctx
-						.verify_backed_candidate(&allowed_relay_parents, candidate_idx, backed_candidate)
-						.is_err()
+					current_concluded_invalid_disputes.contains(&backed_candidate.hash())
 				},
 				&scheduled,
 			);
