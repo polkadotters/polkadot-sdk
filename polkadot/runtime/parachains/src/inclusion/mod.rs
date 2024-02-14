@@ -25,6 +25,7 @@ use crate::{
 	paras::{self, SetGoAhead},
 	scheduler::{self, AvailabilityTimeoutStatus},
 	shared::{self, AllowedRelayParentsTracker},
+	util::make_persisted_validation_data_with_parent,
 };
 use bitvec::{order::Lsb0 as BitOrderLsb0, vec::BitVec};
 use frame_support::{
@@ -376,13 +377,13 @@ pub mod pallet {
 		_,
 		Twox64Concat,
 		ParaId,
-		CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>,
+		Vec<CandidatePendingAvailability<T::Hash, BlockNumberFor<T>>>,
 	>;
 
-	/// The commitments of candidates pending availability, by `ParaId`.
+	/// The commitments of candidates pending availability, by `CoreIndex`.
 	#[pallet::storage]
 	pub(crate) type PendingAvailabilityCommitments<T: Config> =
-		StorageMap<_, Twox64Concat, ParaId, CandidateCommitments>;
+		StorageMap<_, Twox64Concat, ParaId, Vec<CandidateCommitments>>;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {}
@@ -498,6 +499,7 @@ impl<T: Config> Pallet<T> {
 	/// Returns a `Vec` of `CandidateHash`es and their respective `AvailabilityCore`s that became
 	/// available, and cores free.
 	pub(crate) fn update_pending_availability_and_get_freed_cores<F>(
+		allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
 		expected_bits: usize,
 		validators: &[ValidatorId],
 		signed_bitfields: SignedAvailabilityBitfields,
@@ -506,13 +508,8 @@ impl<T: Config> Pallet<T> {
 	where
 		F: Fn(CoreIndex) -> Option<ParaId>,
 	{
-		let mut assigned_paras_record = (0..expected_bits)
-			.map(|bit_index| core_lookup(CoreIndex::from(bit_index as u32)))
-			.map(|opt_para_id| {
-				opt_para_id.map(|para_id| (para_id, PendingAvailability::<T>::get(&para_id)))
-			})
-			.collect::<Vec<_>>();
-
+		// Track the paraids that had one/more of their candidates made available.
+		let paras_made_available = BTreeSet::new();
 		let now = <frame_system::Pallet<T>>::block_number();
 		for (checked_bitfield, validator_index) in
 			signed_bitfields.into_iter().map(|signed_bitfield| {
@@ -521,26 +518,37 @@ impl<T: Config> Pallet<T> {
 				(checked_bitfield, validator_idx)
 			}) {
 			for (bit_idx, _) in checked_bitfield.0.iter().enumerate().filter(|(_, is_av)| **is_av) {
-				let pending_availability = if let Some((_, pending_availability)) =
-					assigned_paras_record[bit_idx].as_mut()
-				{
-					pending_availability
+				let core_index = CoreIndex(bit_idx as u32);
+				let para_id = core_lookup(core_index);
+				if let Some(para_id) = para_id {
+					<PendingAvailability<T>>::mutate(&para_id, |candidates| {
+						candidates.map(|candidates| {
+							candidates
+								.into_iter()
+								.map(|candidate| {
+									if candidate.core == core_index {
+										// defensive check - this is constructed by loading the
+										// availability bitfield record, which is always `Some` if
+										// the core is occupied - that's why we're here.
+										let mut passed_threshold = false;
+										if let Some(bit) = candidate
+											.availability_votes
+											.get_mut(validator_index.0 as usize)
+										{
+											passed_threshold = true;
+											*bit = true;
+										}
+										if passed_threshold {
+											paras_made_available.insert(para_id);
+										}
+									}
+									candidate
+								})
+								.collect::<Vec<_>>()
+						})
+					});
 				} else {
-					// For honest validators, this happens in case of unoccupied cores,
-					// which in turn happens in case of a disputed candidate.
-					// A malicious one might include arbitrary indices, but they are represented
-					// by `None` values and will be sorted out in the next if case.
-					continue
-				};
-
-				// defensive check - this is constructed by loading the availability bitfield
-				// record, which is always `Some` if the core is occupied - that's why we're here.
-				let validator_index = validator_index.0 as usize;
-				if let Some(mut bit) =
-					pending_availability.as_mut().and_then(|candidate_pending_availability| {
-						candidate_pending_availability.availability_votes.get_mut(validator_index)
-					}) {
-					*bit = true;
+					// No parachain is occupying that core yet.
 				}
 			}
 
@@ -553,42 +561,106 @@ impl<T: Config> Pallet<T> {
 		let threshold = availability_threshold(validators.len());
 
 		let mut freed_cores = Vec::with_capacity(expected_bits);
-		for (para_id, pending_availability) in assigned_paras_record
+		// Iterate through the paraids that had one of their candidates made available and see if we
+		// can free any of its occupied cores.
+		// We can only free cores whose candidates are direct descendants of the included para head.
+		// We assume dependency order must be preserved in `PendingAvailability`.
+		for (para_id, candidates_pending_availability) in paras_made_available
 			.into_iter()
-			.flatten()
-			.filter_map(|(id, p)| p.map(|p| (id, p)))
+			.filter_map(|para_id| <PendingAvailability<T>>::get(para_id).map(|c| (para_id, c)))
 		{
-			if pending_availability.availability_votes.count_ones() >= threshold {
-				<PendingAvailability<T>>::remove(&para_id);
-				let commitments = match PendingAvailabilityCommitments::<T>::take(&para_id) {
-					Some(commitments) => commitments,
-					None => {
-						log::warn!(
-							target: LOG_TARGET,
-							"Inclusion::process_bitfields: PendingAvailability and PendingAvailabilityCommitments
-							are out of sync, did someone mess with the storage?",
-						);
-						continue
-					},
-				};
+			let stopped_at_index = 0;
+			let mut latest_parent_head = match <paras::Pallet<T>>::para_head(&para_id) {
+				Some(head) => head,
+				None => continue,
+			};
 
-				let receipt = CommittedCandidateReceipt {
-					descriptor: pending_availability.descriptor,
-					commitments,
-				};
-				let _weight = Self::enact_candidate(
-					pending_availability.relay_parent_number,
-					receipt,
-					pending_availability.backers,
-					pending_availability.availability_votes,
-					pending_availability.core,
-					pending_availability.backing_group,
-				);
+			for (index, pending_availability) in candidates_pending_availability.iter().enumerate()
+			{
+				stopped_at_index = index;
 
-				freed_cores.push((pending_availability.core, pending_availability.hash));
-			} else {
-				<PendingAvailability<T>>::insert(&para_id, &pending_availability);
+				if pending_availability.availability_votes.count_ones() >= threshold {
+					let (relay_parent_storage_root, _) = {
+						match allowed_relay_parents
+							.acquire_info(pending_availability.descriptor.relay_parent, None)
+						{
+							None => break, // TODO: fix this
+							Some(info) => info,
+						}
+					};
+
+					let pvd = make_persisted_validation_data_with_parent::<T>(
+						para_id,
+						pending_availability.relay_parent_number,
+						relay_parent_storage_root,
+						latest_parent_head,
+					);
+					if pvd.hash() != pending_availability.descriptor.persisted_validation_data_hash
+					{
+						// TODO: fix this
+						break;
+					}
+
+					let commitments = match PendingAvailabilityCommitments::<T>::get(&para_id) {
+						Some(commitments) => commitments,
+						None => {
+							log::warn!(
+								target: LOG_TARGET,
+								"Inclusion::process_bitfields: PendingAvailability and PendingAvailabilityCommitments
+								are out of sync, did someone mess with the storage?",
+							);
+							continue
+						},
+					};
+
+					let commitments = match commitments.get(index) {
+						Some(commitments) => commitments,
+						None => {
+							log::warn!(
+								target: LOG_TARGET,
+								"Inclusion::process_bitfields: PendingAvailability and PendingAvailabilityCommitments
+								are out of sync, did someone mess with the storage?",
+							);
+							continue
+						},
+					};
+
+					if commitments.head_data.hash() != pending_availability.descriptor.para_head {
+						break;
+					}
+
+					latest_parent_head = commitments.head_data;
+
+					let receipt = CommittedCandidateReceipt {
+						descriptor: pending_availability.descriptor,
+						commitments: commitments.clone(),
+					};
+					let _weight = Self::enact_candidate(
+						pending_availability.relay_parent_number,
+						receipt,
+						pending_availability.backers,
+						pending_availability.availability_votes,
+						pending_availability.core,
+						pending_availability.backing_group,
+					);
+
+					freed_cores.push((pending_availability.core, pending_availability.hash));
+				}
 			}
+
+			// Trim the pending availability candidates and commitments now.
+			<PendingAvailability<T>>::mutate(&para_id, |candidates| {
+				candidates.map(|candidates| {
+					candidates.drain(0..stopped_at_index);
+					candidates
+				})
+			});
+			<PendingAvailabilityCommitments<T>>::mutate(&para_id, |commitments| {
+				commitments.map(|commitments| {
+					commitments.drain(0..stopped_at_index);
+					commitments
+				})
+			});
 		}
 
 		freed_cores
@@ -602,7 +674,7 @@ impl<T: Config> Pallet<T> {
 	pub(crate) fn process_candidates<GV>(
 		allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
 		candidates: Vec<BackedCandidate<T::Hash>>,
-		scheduled: &BTreeMap<ParaId, CoreIndex>,
+		mut scheduled: BTreeMap<ParaId, Vec<CoreIndex>>,
 		group_validators: GV,
 	) -> Result<ProcessedCandidates<T::Hash>, DispatchError>
 	where
@@ -660,6 +732,7 @@ impl<T: Config> Pallet<T> {
 					session_index: shared::Pallet::<T>::session_index(),
 				};
 
+				// TODO: this is already being done in process_inherent_data.
 				let relay_parent_number = match check_ctx.verify_backed_candidate(
 					&allowed_relay_parents,
 					candidate_idx,
@@ -1025,35 +1098,59 @@ impl<T: Config> Pallet<T> {
 	/// since (i.e. the block number the candidate was backed at in this fork of the relay chain).
 	///
 	/// Returns a vector of cleaned-up core IDs.
-	pub(crate) fn collect_pending(
+	pub(crate) fn collect_timedout(
 		pred: impl Fn(BlockNumberFor<T>) -> AvailabilityTimeoutStatus<BlockNumberFor<T>>,
 	) -> Vec<CoreIndex> {
-		let mut cleaned_up_ids = Vec::new();
+		let mut timed_out_paras = BTreeMap::new();
 		let mut cleaned_up_cores = Vec::new();
 
-		for (para_id, pending_record) in <PendingAvailability<T>>::iter() {
-			if pred(pending_record.backed_in_number).timed_out {
-				cleaned_up_ids.push(para_id);
-				cleaned_up_cores.push(pending_record.core);
+		for (para_id, candidates_pending_availability) in <PendingAvailability<T>>::iter() {
+			for (idx, candidate) in candidates_pending_availability.iter().enumerate() {
+				if pred(candidate.backed_in_number).timed_out {
+					timed_out_paras.insert(para_id, idx);
+					// Found the first timed out candidate of this para. All other successors will
+					// be timed out as well. Break and go to the next para
+					break
+				}
 			}
 		}
 
-		for para_id in cleaned_up_ids {
-			let pending = <PendingAvailability<T>>::take(&para_id);
-			let commitments = <PendingAvailabilityCommitments<T>>::take(&para_id);
+		for (para_id, idx) in timed_out_paras.iter() {
+			let mut timed_out_candidates = None;
+			let mut timed_out_commitments = None;
 
-			if let (Some(pending), Some(commitments)) = (pending, commitments) {
-				// defensive: this should always be true.
-				let candidate = CandidateReceipt {
-					descriptor: pending.descriptor,
-					commitments_hash: commitments.hash(),
-				};
+			<PendingAvailability<T>>::mutate(&para_id, |candidates| {
+				candidates.map(|candidates| {
+					timed_out_candidates = Some(candidates.drain(idx..));
+					candidates
+				})
+			});
 
-				Self::deposit_event(Event::<T>::CandidateTimedOut(
-					candidate,
-					commitments.head_data,
-					pending.core,
-				));
+			<PendingAvailabilityCommitments<T>>::mutate(&para_id, |commitments| {
+				commitments.map(|commitments| {
+					timed_out_commitments = Some(commitments.drain(idx..));
+					commitments
+				})
+			});
+
+			if let (Some(candidates), Some(commitments)) =
+				(timed_out_candidates, timed_out_commitments)
+			{
+				for (candidate, commitments) in candidates.zip(commitments) {
+					cleaned_up_cores.push(candidate.core);
+
+					// defensive: this should always be true.
+					let receipt = CandidateReceipt {
+						descriptor: candidate.descriptor,
+						commitments_hash: commitments.hash(),
+					};
+
+					Self::deposit_event(Event::<T>::CandidateTimedOut(
+						receipt,
+						commitments.head_data,
+						candidate.core,
+					));
+				}
 			}
 		}
 
@@ -1064,19 +1161,36 @@ impl<T: Config> Pallet<T> {
 	///
 	/// Returns a vector of cleaned-up core IDs.
 	pub(crate) fn collect_disputed(disputed: &BTreeSet<CandidateHash>) -> Vec<CoreIndex> {
-		let mut cleaned_up_ids = Vec::new();
-		let mut cleaned_up_cores = Vec::new();
+		let mut cleaned_up_cores = Vec::with_capacity(disputed.len());
 
-		for (para_id, pending_record) in <PendingAvailability<T>>::iter() {
-			if disputed.contains(&pending_record.hash) {
-				cleaned_up_ids.push(para_id);
-				cleaned_up_cores.push(pending_record.core);
+		for (para_id, pending_candidates) in <PendingAvailability<T>>::iter() {
+			// We assume that pending candidates are stored in dependency order. So we need to store
+			// the earliest disputed candidate. All others that follow will get freed as well.
+			let mut earliest_disputed_idx = None;
+			for (index, candidate) in pending_candidates.iter().enumerate() {
+				if disputed.contains(&candidate.hash) {
+					if let Some(prev_disputed_idx) = earliest_disputed_idx {
+						// Find the earliest disputed index.
+						earliest_disputed_idx = Some(sp_std::cmp::min(prev_disputed_idx, index));
+					}
+				}
+				if let Some(earliest_disputed_idx) = earliest_disputed_idx {
+					// Mark cores that descend from the earliest disputed index as freed.
+					if index >= earliest_disputed_idx {
+						cleaned_up_cores.push(candidate.core);
+					}
+				}
 			}
-		}
 
-		for para_id in cleaned_up_ids {
-			let _ = <PendingAvailability<T>>::take(&para_id);
-			let _ = <PendingAvailabilityCommitments<T>>::take(&para_id);
+			if let Some(earliest_disputed_idx) = earliest_disputed_idx {
+				// do cleanups.
+				<PendingAvailability<T>>::mutate(&para_id, |record| {
+					record.map(|r| r.truncate(earliest_disputed_idx))
+				});
+				<PendingAvailabilityCommitments<T>>::mutate(&para_id, |record| {
+					record.map(|r| r.truncate(earliest_disputed_idx))
+				});
+			}
 		}
 
 		cleaned_up_cores

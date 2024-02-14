@@ -247,7 +247,7 @@ pub mod pallet {
 		// Handle timeouts for any availability core work.
 		let freed_timeout = if <scheduler::Pallet<T>>::availability_timeout_check_required() {
 			let pred = <scheduler::Pallet<T>>::availability_timeout_predicate();
-			<inclusion::Pallet<T>>::collect_pending(pred)
+			<inclusion::Pallet<T>>::collect_timedout(pred)
 		} else {
 			Vec::new()
 		};
@@ -569,6 +569,7 @@ impl<T: Config> Pallet<T> {
 		// work has now concluded.
 		let freed_concluded =
 			<inclusion::Pallet<T>>::update_pending_availability_and_get_freed_cores::<_>(
+				&allowed_relay_parents,
 				expected_bits,
 				&validator_public[..],
 				bitfields.clone(),
@@ -585,9 +586,12 @@ impl<T: Config> Pallet<T> {
 		let freed = collect_all_freed_cores::<T, _>(freed_concluded.iter().cloned());
 
 		<scheduler::Pallet<T>>::free_cores_and_fill_claimqueue(freed, now);
-		let scheduled = <scheduler::Pallet<T>>::scheduled_paras()
-			.map(|(core_idx, para_id)| (para_id, core_idx))
-			.collect();
+		let scheduled: BTreeMap<ParaId, Vec<CoreIndex>> = <scheduler::Pallet<T>>::scheduled_paras()
+			.map(|(core_index, para_id)| (para_id, core_index))
+			.fold(BTreeMap::new(), |acc, (para_id, core_index)| {
+				acc.entry(para_id).or_insert_with(|| vec![]).push(core_index);
+				acc
+			});
 
 		METRICS.on_candidates_processed_total(backed_candidates.len() as u64);
 
@@ -602,7 +606,9 @@ impl<T: Config> Pallet<T> {
 					let prev_context = <paras::Pallet<T>>::para_most_recent_context(para_id);
 					let check_ctx = CandidateCheckContext::<T>::new(prev_context);
 
-					// never include a concluded-invalid candidate
+					// never include a concluded-invalid candidate. we don't need to check for
+					// descendants of concluded-invalid candidates as those descendants have already
+					// been evicted from the cores and the included head data won't match.
 					current_concluded_invalid_disputes.contains(&backed_candidate.hash()) ||
 					// Instead of checking the candidates with code upgrades twice
 					// move the checking up here and skip it in the training wheels fallback.
@@ -633,7 +639,7 @@ impl<T: Config> Pallet<T> {
 		} = <inclusion::Pallet<T>>::process_candidates(
 			&allowed_relay_parents,
 			backed_candidates.clone(),
-			&scheduled,
+			scheduled,
 			<scheduler::Pallet<T>>::group_validators,
 		)?;
 		// Note which of the scheduled cores were actually occupied by a backed candidate.
@@ -944,7 +950,7 @@ fn sanitize_backed_candidates<
 	mut backed_candidates: Vec<BackedCandidate<T::Hash>>,
 	allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
 	mut candidate_has_concluded_invalid_dispute_or_is_invalid: F,
-	scheduled: &BTreeMap<ParaId, CoreIndex>,
+	scheduled: &BTreeMap<ParaId, Vec<CoreIndex>>,
 ) -> SanitizedBackedCandidates<T::Hash> {
 	// Remove any candidates that were concluded invalid.
 	// This does not assume sorting.
@@ -952,15 +958,14 @@ fn sanitize_backed_candidates<
 		!candidate_has_concluded_invalid_dispute_or_is_invalid(candidate_idx, backed_candidate)
 	});
 
-	// Assure the backed candidate's `ParaId`'s core is free.
+	// Assure the backed candidate's `ParaId`' has enough scheduled cores.
 	// This holds under the assumption that `Scheduler::schedule` is called _before_.
 	// We don't check the relay-parent because this is done in the closure when
 	// constructing the inherent and during actual processing otherwise.
-
 	backed_candidates.retain(|backed_candidate| {
 		let desc = backed_candidate.descriptor();
 
-		scheduled.get(&desc.para_id).is_some()
+		!scheduled.get(&desc.para_id).unwrap_or_else(|| &vec![]).is_empty()
 	});
 
 	// Filter out backing statements from disabled validators
@@ -969,16 +974,6 @@ fn sanitize_backed_candidates<
 		&allowed_relay_parents,
 		scheduled,
 	);
-
-	// Sort the `Vec` last, once there is a guarantee that these
-	// `BackedCandidates` references the expected relay chain parent,
-	// but more importantly are scheduled for a free core.
-	// This both avoids extra work for obviously invalid candidates,
-	// but also allows this to be done in place.
-	backed_candidates.sort_by(|x, y| {
-		// Never panics, since we filtered all panic arguments out in the previous `fn retain`.
-		scheduled[&x.descriptor().para_id].cmp(&scheduled[&y.descriptor().para_id])
-	});
 
 	SanitizedBackedCandidates {
 		backed_candidates,
@@ -1073,7 +1068,7 @@ fn limit_and_sanitize_disputes<
 fn filter_backed_statements_from_disabled_validators<T: shared::Config + scheduler::Config>(
 	backed_candidates: &mut Vec<BackedCandidate<<T as frame_system::Config>::Hash>>,
 	allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
-	scheduled: &BTreeMap<ParaId, CoreIndex>,
+	scheduled: &BTreeMap<ParaId, Vec<CoreIndex>>,
 ) -> bool {
 	let disabled_validators =
 		BTreeSet::<_>::from_iter(shared::Pallet::<T>::disabled_validators().into_iter());
@@ -1094,76 +1089,78 @@ fn filter_backed_statements_from_disabled_validators<T: shared::Config + schedul
 	// the validator group assigned to the parachain. To obtain this group we need:
 	// 1. Core index assigned to the parachain which has produced the candidate
 	// 2. The relay chain block number of the candidate
-	backed_candidates.retain_mut(|bc| {
-		// Get `core_idx` assigned to the `para_id` of the candidate
-		let core_idx = match scheduled.get(&bc.descriptor().para_id) {
-			Some(core_idx) => *core_idx,
-			None => {
-				log::debug!(target: LOG_TARGET, "Can't get core idx of a backed candidate for para id {:?}. Dropping the candidate.", bc.descriptor().para_id);
-				return false
-			}
-		};
+	// TODO: will be handled in https://github.com/paritytech/polkadot-sdk/pull/3231
+	// backed_candidates.retain_mut(|bc| {
+	// 	// Get `core_idx` assigned to the `para_id` of the candidate
+	// 	let core_idx = match scheduled.get(&bc.descriptor().para_id) {
+	// 		Some(core_idx) => *core_idx,
+	// 		None => {
+	// 			log::debug!(target: LOG_TARGET, "Can't get core idx of a backed candidate for para id {:?}.
+	// Dropping the candidate.", bc.descriptor().para_id); 			return false
+	// 		}
+	// 	};
 
-		// Get relay parent block number of the candidate. We need this to get the group index assigned to this core at this block number
-		let relay_parent_block_number = match allowed_relay_parents
-			.acquire_info(bc.descriptor().relay_parent, None) {
-				Some((_, block_num)) => block_num,
-				None => {
-					log::debug!(target: LOG_TARGET, "Relay parent {:?} for candidate is not in the allowed relay parents. Dropping the candidate.", bc.descriptor().relay_parent);
-					return false
-				}
-			};
+	// 	// Get relay parent block number of the candidate. We need this to get the group index
+	// assigned to this core at this block number 	let relay_parent_block_number = match
+	// allowed_relay_parents 		.acquire_info(bc.descriptor().relay_parent, None) {
+	// 			Some((_, block_num)) => block_num,
+	// 			None => {
+	// 				log::debug!(target: LOG_TARGET, "Relay parent {:?} for candidate is not in the allowed relay
+	// parents. Dropping the candidate.", bc.descriptor().relay_parent); 				return false
+	// 			}
+	// 		};
 
-		// Get the group index for the core
-		let group_idx = match <scheduler::Pallet<T>>::group_assigned_to_core(
-			core_idx,
-			relay_parent_block_number + One::one(),
-		) {
-			Some(group_idx) => group_idx,
-			None => {
-				log::debug!(target: LOG_TARGET, "Can't get the group index for core idx {:?}. Dropping the candidate.", core_idx);
-				return false
-			},
-		};
+	// 	// Get the group index for the core
+	// 	let group_idx = match <scheduler::Pallet<T>>::group_assigned_to_core(
+	// 		core_idx,
+	// 		relay_parent_block_number + One::one(),
+	// 	) {
+	// 		Some(group_idx) => group_idx,
+	// 		None => {
+	// 			log::debug!(target: LOG_TARGET, "Can't get the group index for core idx {:?}. Dropping the
+	// candidate.", core_idx); 			return false
+	// 		},
+	// 	};
 
-		// And finally get the validator group for this group index
-		let validator_group = match <scheduler::Pallet<T>>::group_validators(group_idx) {
-			Some(validator_group) => validator_group,
-			None => {
-				log::debug!(target: LOG_TARGET, "Can't get the validators from group {:?}. Dropping the candidate.", group_idx);
-				return false
-			}
-		};
+	// 	// And finally get the validator group for this group index
+	// 	let validator_group = match <scheduler::Pallet<T>>::group_validators(group_idx) {
+	// 		Some(validator_group) => validator_group,
+	// 		None => {
+	// 			log::debug!(target: LOG_TARGET, "Can't get the validators from group {:?}. Dropping the
+	// candidate.", group_idx); 			return false
+	// 		}
+	// 	};
 
-		// Bitmask with the disabled indices within the validator group
-		let disabled_indices = BitVec::<u8, bitvec::order::Lsb0>::from_iter(validator_group.iter().map(|idx| disabled_validators.contains(idx)));
-		// The indices of statements from disabled validators in `BackedCandidate`. We have to drop these.
-		let indices_to_drop = disabled_indices.clone() & &bc.validator_indices;
-		// Apply the bitmask to drop the disabled validator from `validator_indices`
-		bc.validator_indices &= !disabled_indices;
-		// Remove the corresponding votes from `validity_votes`
-		for idx in indices_to_drop.iter_ones().rev() {
-			bc.validity_votes.remove(idx);
-		}
+	// 	// Bitmask with the disabled indices within the validator group
+	// 	let disabled_indices = BitVec::<u8,
+	// bitvec::order::Lsb0>::from_iter(validator_group.iter().map(|idx|
+	// disabled_validators.contains(idx))); 	// The indices of statements from disabled validators in
+	// `BackedCandidate`. We have to drop these. 	let indices_to_drop = disabled_indices.clone() &
+	// &bc.validator_indices; 	// Apply the bitmask to drop the disabled validator from
+	// `validator_indices` 	bc.validator_indices &= !disabled_indices;
+	// 	// Remove the corresponding votes from `validity_votes`
+	// 	for idx in indices_to_drop.iter_ones().rev() {
+	// 		bc.validity_votes.remove(idx);
+	// 	}
 
-		// If at least one statement was dropped we need to return `true`
-		if indices_to_drop.count_ones() > 0 {
-			filtered = true;
-		}
+	// 	// If at least one statement was dropped we need to return `true`
+	// 	if indices_to_drop.count_ones() > 0 {
+	// 		filtered = true;
+	// 	}
 
-		// By filtering votes we might render the candidate invalid and cause a failure in
-		// [`process_candidates`]. To avoid this we have to perform a sanity check here. If there
-		// are not enough backing votes after filtering we will remove the whole candidate.
-		if bc.validity_votes.len() < effective_minimum_backing_votes(
-			validator_group.len(),
-			minimum_backing_votes
+	// 	// By filtering votes we might render the candidate invalid and cause a failure in
+	// 	// [`process_candidates`]. To avoid this we have to perform a sanity check here. If there
+	// 	// are not enough backing votes after filtering we will remove the whole candidate.
+	// 	if bc.validity_votes.len() < effective_minimum_backing_votes(
+	// 		validator_group.len(),
+	// 		minimum_backing_votes
 
-		) {
-			return false
-		}
+	// 	) {
+	// 		return false
+	// 	}
 
-		true
-	});
+	// 	true
+	// });
 
 	// Also return `true` if a whole candidate was dropped from the set
 	filtered || backed_len_before != backed_candidates.len()
