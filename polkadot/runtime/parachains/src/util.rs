@@ -47,7 +47,6 @@ pub fn make_persisted_validation_data<T: paras::Config + hrmp::Config>(
 ///
 /// This ties together the storage of several modules.
 pub fn make_persisted_validation_data_with_parent<T: paras::Config>(
-	para_id: ParaId,
 	relay_parent_number: BlockNumberFor<T>,
 	relay_parent_storage_root: T::Hash,
 	parent_head: HeadData,

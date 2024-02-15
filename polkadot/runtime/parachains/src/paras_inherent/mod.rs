@@ -24,11 +24,8 @@
 use crate::{
 	configuration,
 	disputes::DisputesHandler,
-	inclusion,
-	inclusion::CandidateCheckContext,
-	initializer,
+	inclusion, initializer,
 	metrics::METRICS,
-	paras,
 	scheduler::{self, FreedReason},
 	shared::{self, AllowedRelayParentsTracker},
 	ParaId,
@@ -43,8 +40,8 @@ use frame_support::{
 use frame_system::pallet_prelude::*;
 use pallet_babe::{self, ParentBlockRandomness};
 use primitives::{
-	effective_minimum_backing_votes, BackedCandidate, CandidateHash, CandidateReceipt,
-	CheckedDisputeStatementSet, CheckedMultiDisputeStatementSet, CoreIndex, DisputeStatementSet,
+	BackedCandidate, CandidateHash, CandidateReceipt, CheckedDisputeStatementSet,
+	CheckedMultiDisputeStatementSet, CoreIndex, DisputeStatementSet,
 	InherentData as ParachainsInherentData, MultiDisputeStatementSet, ScrapedOnChainVotes,
 	SessionIndex, SignedAvailabilityBitfields, SigningContext, UncheckedSignedAvailabilityBitfield,
 	UncheckedSignedAvailabilityBitfields, ValidatorId, ValidatorIndex, ValidityAttestation,
@@ -588,7 +585,7 @@ impl<T: Config> Pallet<T> {
 		<scheduler::Pallet<T>>::free_cores_and_fill_claimqueue(freed, now);
 		let scheduled: BTreeMap<ParaId, Vec<CoreIndex>> = <scheduler::Pallet<T>>::scheduled_paras()
 			.map(|(core_index, para_id)| (para_id, core_index))
-			.fold(BTreeMap::new(), |acc, (para_id, core_index)| {
+			.fold(BTreeMap::new(), |mut acc, (para_id, core_index)| {
 				acc.entry(para_id).or_insert_with(|| vec![]).push(core_index);
 				acc
 			});
@@ -599,13 +596,7 @@ impl<T: Config> Pallet<T> {
 			sanitize_backed_candidates::<T, _>(
 				backed_candidates,
 				&allowed_relay_parents,
-				|candidate_idx: usize,
-				 backed_candidate: &BackedCandidate<<T as frame_system::Config>::Hash>|
-				 -> bool {
-					let para_id = backed_candidate.descriptor().para_id;
-					let prev_context = <paras::Pallet<T>>::para_most_recent_context(para_id);
-					let check_ctx = CandidateCheckContext::<T>::new(prev_context);
-
+				|backed_candidate: &BackedCandidate<<T as frame_system::Config>::Hash>| -> bool {
 					// never include a concluded-invalid candidate. we don't need to check for
 					// descendants of concluded-invalid candidates as those descendants have already
 					// been evicted from the cores and the included head data won't match.
@@ -936,7 +927,7 @@ struct SanitizedBackedCandidates<Hash> {
 /// occupied core index.
 fn sanitize_backed_candidates<
 	T: crate::inclusion::Config,
-	F: FnMut(usize, &BackedCandidate<T::Hash>) -> bool,
+	F: FnMut(&BackedCandidate<T::Hash>) -> bool,
 >(
 	mut backed_candidates: Vec<BackedCandidate<T::Hash>>,
 	allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
@@ -945,18 +936,18 @@ fn sanitize_backed_candidates<
 ) -> SanitizedBackedCandidates<T::Hash> {
 	// Remove any candidates that were concluded invalid.
 	// This does not assume sorting.
-	backed_candidates.indexed_retain(move |candidate_idx, backed_candidate| {
-		!candidate_has_concluded_invalid_dispute_or_is_invalid(candidate_idx, backed_candidate)
+	backed_candidates.retain(move |backed_candidate| {
+		!candidate_has_concluded_invalid_dispute_or_is_invalid(backed_candidate)
 	});
 
-	// Assure the backed candidate's `ParaId`' has enough scheduled cores.
-	// This holds under the assumption that `Scheduler::schedule` is called _before_.
-	// We don't check the relay-parent because this is done in the closure when
+	// TODO: Assure the backed candidate's `ParaId`' has enough scheduled cores. We currently only
+	// check that we have one This holds under the assumption that `Scheduler::schedule` is called
+	// _before_. We don't check the relay-parent because this is done in the closure when
 	// constructing the inherent and during actual processing otherwise.
 	backed_candidates.retain(|backed_candidate| {
 		let desc = backed_candidate.descriptor();
 
-		!scheduled.get(&desc.para_id).unwrap_or_else(|| &vec![]).is_empty()
+		!scheduled.get(&desc.para_id).map(|s| s.is_empty()).unwrap_or(true)
 	});
 
 	// Filter out backing statements from disabled validators
@@ -1074,7 +1065,7 @@ fn filter_backed_statements_from_disabled_validators<T: shared::Config + schedul
 	// Flag which will be returned. Set to `true` if at least one vote is filtered.
 	let mut filtered = false;
 
-	let minimum_backing_votes = configuration::Pallet::<T>::config().minimum_backing_votes;
+	// let minimum_backing_votes = configuration::Pallet::<T>::config().minimum_backing_votes;
 
 	// Process all backed candidates. `validator_indices` in `BackedCandidates` are indices within
 	// the validator group assigned to the parachain. To obtain this group we need:
