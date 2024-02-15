@@ -567,7 +567,6 @@ impl<T: Config> Pallet<T> {
 		let freed_concluded =
 			<inclusion::Pallet<T>>::update_pending_availability_and_get_freed_cores::<_>(
 				&allowed_relay_parents,
-				expected_bits,
 				&validator_public[..],
 				bitfields.clone(),
 				<scheduler::Pallet<T>>::core_para,
@@ -583,12 +582,13 @@ impl<T: Config> Pallet<T> {
 		let freed = collect_all_freed_cores::<T, _>(freed_concluded.iter().cloned());
 
 		<scheduler::Pallet<T>>::free_cores_and_fill_claimqueue(freed, now);
-		let scheduled: BTreeMap<ParaId, Vec<CoreIndex>> = <scheduler::Pallet<T>>::scheduled_paras()
-			.map(|(core_index, para_id)| (para_id, core_index))
-			.fold(BTreeMap::new(), |mut acc, (para_id, core_index)| {
-				acc.entry(para_id).or_insert_with(|| vec![]).push(core_index);
-				acc
-			});
+		let scheduled: BTreeMap<ParaId, BTreeSet<CoreIndex>> =
+			<scheduler::Pallet<T>>::scheduled_paras()
+				.map(|(core_index, para_id)| (para_id, core_index))
+				.fold(BTreeMap::new(), |mut acc, (para_id, core_index)| {
+					acc.entry(para_id).or_insert_with(|| BTreeSet::new()).insert(core_index);
+					acc
+				});
 
 		METRICS.on_candidates_processed_total(backed_candidates.len() as u64);
 
@@ -932,7 +932,7 @@ fn sanitize_backed_candidates<
 	mut backed_candidates: Vec<BackedCandidate<T::Hash>>,
 	allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
 	mut candidate_has_concluded_invalid_dispute_or_is_invalid: F,
-	scheduled: &BTreeMap<ParaId, Vec<CoreIndex>>,
+	scheduled: &BTreeMap<ParaId, BTreeSet<CoreIndex>>,
 ) -> SanitizedBackedCandidates<T::Hash> {
 	// Remove any candidates that were concluded invalid.
 	// This does not assume sorting.
@@ -1050,7 +1050,7 @@ fn limit_and_sanitize_disputes<
 fn filter_backed_statements_from_disabled_validators<T: shared::Config + scheduler::Config>(
 	backed_candidates: &mut Vec<BackedCandidate<<T as frame_system::Config>::Hash>>,
 	allowed_relay_parents: &AllowedRelayParentsTracker<T::Hash, BlockNumberFor<T>>,
-	scheduled: &BTreeMap<ParaId, Vec<CoreIndex>>,
+	scheduled: &BTreeMap<ParaId, BTreeSet<CoreIndex>>,
 ) -> bool {
 	let disabled_validators =
 		BTreeSet::<_>::from_iter(shared::Pallet::<T>::disabled_validators().into_iter());
